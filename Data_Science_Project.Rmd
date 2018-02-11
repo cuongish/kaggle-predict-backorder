@@ -1,0 +1,261 @@
+---
+title: "Backorders Prediction"
+author: 
+date:
+output: html_document
+---
+
+```{r setup , include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Set input folder and working directory
+
+```{r}
+inputfolder <- "/Users/traanh/Downloads/predict-bo-trial"
+setwd(inputfolder)
+
+```
+
+Install Packages
+
+```{r}
+#install.packages("randomForest")
+#install.packages("caret")
+#install.packages("pROC")
+#install.packages("ROSE")
+#install.packages("knitr")
+#install.packages("magrittr")
+#install.packages("gridExtra")
+#install.packages("GGally")
+#install.packages("rpart.plot")
+```
+## Preparing Libraries
+```{r}
+library(dplyr)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(DT)
+library(GGally)
+library(randomForest)
+library(rpart)
+library(caret)
+library(pROC)
+library(ROSE)
+library(magrittr)
+library(tidyr)
+library(rpart.plot)
+library(h2o)
+library(tibble)
+
+
+```
+## Loading the data 
+Loading both training and testing datasets
+
+```{r retrieve data, code_folding=show}
+raw_train <- read.csv(paste(inputfolder, "Kaggle_Training_Dataset_v2.csv",sep="/"), stringsAsFactors = FALSE)
+raw_test <- read.csv(paste(inputfolder, "Kaggle_Test_Dataset_v2.csv",sep="/"), stringsAsFactors = FALSE)
+
+```
+
+# 1. Data Inspection
+
+```{r}
+# Examine the training dataset
+str(raw_train)
+head(raw_train)
+raw_train$went_on_backorder %>% table() %>% prop.table()
+
+# Examine the testing dataset
+str(raw_test)
+head(raw_test)
+raw_test$went_on_backorder %>% table() %>% prop.table()
+
+```
+
+Both training and testing datasets have missing values (*NA*) mainly in `lead_time` variable and outliers with the values = -99 in `perf_6_month_avg` and `perf_12_month_avg` variables 
+Both training and testing datasets are severely imbalanced
+
+# 2. Data Cleaning 
+
+
+## 2.1. Rebalance the datasets
+
+We use `ROSE` library to balance the datasets
+https://www.analyticsvidhya.com/blog/2016/03/practical-guide-deal-imbalanced-classification-problems/
+
+```{r}
+
+train_balanced<- ovun.sample(went_on_backorder~., data=raw_train, N=nrow(raw_train), p=0.5, seed=1, method="both")$data 
+
+test_balanced <- ovun.sample(went_on_backorder~., data=raw_test,N=nrow(raw_test), p=0.5, seed=1, method="both")$data
+
+table(train_balanced$went_on_backorder)
+
+```
+
+## 2.2. Validation Set 80-20 
+We create a validation set from the training data with the random split of 80-20. The validation set would be used for building models.
+
+```{r construct training and validation sets}
+
+n <- nrow(train_balanced)
+n_train <- round(0.8 * n) 
+seed <- 1234567
+set.seed(seed)
+train_indices <- sample(1:n, n_train)
+
+raw_train_80 <- train_balanced[train_indices, ]  
+raw_val_20 <- train_balanced[-train_indices, ]  
+
+```
+## 2.3. Data-Preprocessing 
+
+Next we will clean the datasets by :
+  * Dropping unnecessary columns 
+  * Handling missing values (*NA*)
+  * Deleting ouliers
+
+```{r}
+
+# Creating a customized function to clean data : drop `sku` column, eliminate NA and ouliers(-99)
+preprocess_raw_data <- function(data) {
+    # data = data frame of backorder data
+    data[data == -99] <- NA
+    data %>%
+        select(-sku) %>%
+        drop_na() %>%
+        mutate_if(is.character, .funs = function(x) ifelse(x == "Yes", 1, 0)) %>%
+        mutate(went_on_backorder = as.factor(went_on_backorder))
+}
+
+# Applying the function created above to these raw datasets : training, testing and validation
+
+clean_train_80 <- preprocess_raw_data(raw_train_80) 
+clean_test <- preprocess_raw_data(raw_val_20)
+clean_val_20 <- preprocess_raw_data(test_balanced)
+
+#Checking whether all datasets are clean and balanced 
+
+glimpse(clean_train_80)
+summary(clean_train_80)
+table(clean_train_80$went_on_backorder)
+any(is.na(clean_train_80))
+any(is.na(clean_test))
+any(is.na(clean_val_20))
+
+
+
+```
+# 3. Data Visualization
+
+
+
+# 4. Modeling
+
+## 4.1 Simple Decision-Tree model 
+
+Next we build decision tree model from clean and balanced training dataset
+
+```{r}
+
+
+sim_tree <- rpart(formula = went_on_backorder ~ . , 
+                  data = clean_train_80, 
+                  method = "class",
+                  parms = list(split='information'), 
+                  control = rpart.control(maxdepth = 3, cp = 0 ))
+
+rpart.plot(sim_tree)
+
+```
+### 4.1.1. Predict using the simple decision-tree model
+
+```{r confusion matrix for the basic model}
+
+# Generate predicted classes using the model object
+class_prediction <- predict(sim_tree, clean_test, type = "class")  
+                            
+# Calculate the confusion matrix for the test set
+confusionMatrix(class_prediction, clean_test$went_on_backorder)
+
+```
+
+### 4.1.2. ROC curves 
+```{r}
+
+roc_sim <- plot.roc(clean_test$went_on_backorder, predict(sim_tree, type = "prob", newdata = clean_test)[, 2], main="Confidence intervals", percent=TRUE, ci=TRUE, print.auc=TRUE) 
+
+# CI of sensitivity
+ci <- ci.se(roc_sim, specificities=seq(0, 100, 5)) # over a select set of specificities
+plot(ci, type="shape", col="#1c61b6AA") # plot as a blue shape
+plot(ci(roc_sim, of="thresholds", thresholds="best")) # add one threshold
+```
+
+
+## 4.2 Auto Classification Modelling 
+* Loading the h2o package
+```{r}
+# Initialize h2o and turn off progress bars
+h2o.init()
+h2o.no_progress()
+```
+* Convert the dataframe to h2oFrame
+```{r}
+# Since h2o package deals with h2oFrame, we convert the datasets to h2oFrame
+
+train_h2o <- as.h2o(clean_train_80)
+test_h2o <- as.h2o(clean_test)
+val_h2o <- as.h2o(clean_val_20)
+
+
+```
+* Creat the h2o model
+```{r}
+
+automodel_h2o <- h2o.automl(x = setdiff(names(train_h2o), "went_on_backorder"), y = "went_on_backorder", training_frame = train_h2o, validation_frame = val_h2o, leaderboard_frame = test_h2o , max_runtime_secs =  30 ) 
+
+# Choosing the leader
+leader <- automodel_h2o@leader
+
+
+```
+
+
+```{r}
+print(leader)
+
+
+pred_h2o <- h2o.predict(leader, newdata = test_h2o)
+# p0 is the probability of predicting the class (0/1)
+# the results are converted to dataframe by using as.tibble() 
+
+as.tibble(pred_h2o)
+```
+
+
+## Model Evaluation 
+
+### Performance Metrics
+
+```{r}
+
+perf_h2o <- h2o.performance(leader, newdata = test_h2o) 
+h2o.metric(perf_h2o) %>% as.tibble() %>% glimpse()
+
+```
+### AUC 
+
+Calculating `AUC` for the test set
+
+```{r}
+
+h2o.auc(perf_h2o)
+```
+### ROC 
+```{r}
+
+
+
