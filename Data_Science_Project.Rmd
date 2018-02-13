@@ -46,9 +46,9 @@ library(ROSE)
 library(magrittr)
 library(tidyr)
 library(rpart.plot)
-library(h2o)
 library(tibble)
-
+library(ROCR)
+library(purrr)
 
 ```
 ## Loading the data 
@@ -61,7 +61,7 @@ raw_test <- read.csv(paste(inputfolder, "Kaggle_Test_Dataset_v2.csv",sep="/"), s
 ```
 
 # 1. Data Inspection
-
+## 1.1 Descriptive Analysis 
 ```{r}
 # Examine the training dataset
 str(raw_train)
@@ -73,11 +73,31 @@ str(raw_test)
 head(raw_test)
 raw_test$went_on_backorder %>% table() %>% prop.table()
 
+glimpse(raw_train)
 ```
 
 Both training and testing datasets have missing values (*NA*) mainly in `lead_time` variable and outliers with the values = -99 in `perf_6_month_avg` and `perf_12_month_avg` variables 
 Both training and testing datasets are severely imbalanced
+ 
+## 1.2 Data Visualization
 
+
+```{r}
+qplot( as.factor(raw_train$went_on_backorder) ) + 
+    geom_bar() + 
+    labs(x="went_on_backorder", y="Count")
+
+```
+```{r}
+
+raw_train %>% gather(- went_on_backorder, key = "went_on_backorder",value = "value") %>% ggplot(aes(x = value , y =went_on_backorder)) + geom_point() + facet_wrap(~ went_on_backorder, scales = "free") + theme_bw()
+
+```
+
+
+
+
+ 
 # 2. Data Cleaning 
 
 
@@ -95,9 +115,26 @@ test_balanced <- ovun.sample(went_on_backorder~., data=raw_test,N=nrow(raw_test)
 table(train_balanced$went_on_backorder)
 
 ```
+```{r}
 
+
+train_balanced_under <- ovun.sample(went_on_backorder ~ ., data = raw_train, method = "under", N = 20000, seed = 1)$data
+
+test_balanced_under <- ovun.sample(went_on_backorder ~ ., data = raw_test, method = "under", N = 5000, seed = 1 )$data
+
+table(train_balanced_under$went_on_backorder)
+```
+
+```{r}
+qplot( as.factor(train_balanced$went_on_backorder) ) + 
+    geom_bar() + 
+    labs(x="went_on_backorder", y="Count")
+```
 ## 2.2. Validation Set 80-20 
 We create a validation set from the training data with the random split of 80-20. The validation set would be used for building models.
+```{r}
+
+```
 
 ```{r construct training and validation sets}
 
@@ -136,6 +173,9 @@ preprocess_raw_data <- function(data) {
 clean_train_80 <- preprocess_raw_data(raw_train_80) 
 clean_test <- preprocess_raw_data(raw_val_20)
 clean_val_20 <- preprocess_raw_data(test_balanced)
+clean_train <- preprocess_raw_data(train_balanced)
+
+clean_train_under <- preprocess_raw_data(train_balanced_under)
 
 #Checking whether all datasets are clean and balanced 
 
@@ -151,6 +191,24 @@ any(is.na(clean_val_20))
 ```
 # 3. Data Visualization
 
+```{r}
+
+
+qplot( as.factor(raw_train$went_on_backorder) ) + 
+    geom_bar() + 
+    labs(x="went_on_backorder", y="Count")
+
+
+clean_test %>% gather(- went_on_backorder, key = "went_on_backorder",value = "value") %>% ggplot(aes(x = value , y =went_on_backorder)) + geom_point() + facet_wrap(~ went_on_backorder, scales = "free") + theme_bw()
+
+```
+
+
+
+```{r}
+write.csv(clean_train_80, "clean_train_80.csv")
+write.csv(clean_test, "clean_test.csv")
+```
 
 
 # 4. Modeling
@@ -193,69 +251,65 @@ ci <- ci.se(roc_sim, specificities=seq(0, 100, 5)) # over a select set of specif
 plot(ci, type="shape", col="#1c61b6AA") # plot as a blue shape
 plot(ci(roc_sim, of="thresholds", thresholds="best")) # add one threshold
 ```
+## 4.2 Random Forest
 
-
-## 4.2 Auto Classification Modelling 
-* Loading the h2o package
 ```{r}
-# Initialize h2o and turn off progress bars
-h2o.init()
-h2o.no_progress()
-```
-* Convert the dataframe to h2oFrame
-```{r}
-# Since h2o package deals with h2oFrame, we convert the datasets to h2oFrame
+# Create model with default paramters
 
-train_h2o <- as.h2o(clean_train_80)
-test_h2o <- as.h2o(clean_test)
-val_h2o <- as.h2o(clean_val_20)
+control <- trainControl(method="repeatedcv", number=10, repeats=3)
+set.seed(seed)
+metric <- "Accuracy"
 
+# Using naive rule to fix the mtry parameter
+mtry <- sqrt(ncol(clean_train_under) - 3)
 
-```
-* Creat the h2o model
-```{r}
+tunegrid <- expand.grid(.mtry=mtry)
+rf_default <- train(went_on_backorder ~ . , data=clean_train_under, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
+print(rf_default)
 
-automodel_h2o <- h2o.automl(x = setdiff(names(train_h2o), "went_on_backorder"), y = "went_on_backorder", training_frame = train_h2o, validation_frame = val_h2o, leaderboard_frame = test_h2o , max_runtime_secs =  30 ) 
+pred = predict(rf_default, newdata = test_balanced)
+confusionMatrix(data = pred, reference = test_balanced$went_on_backorder, positive = "Yes")  
 
-# Choosing the leader
-leader <- automodel_h2o@leader
+rocobj <- plot.roc(test_balanced$went_on_backorder, predict(rf_default, type = "prob", newdata = test_balanced)[, 2], main="Confidence intervals", percent=TRUE, ci=TRUE, print.auc=TRUE) 
 
+# CI of sensitivity
+ciobj <- ci.se(rocobj, specificities=seq(0, 100, 5)) # over a select set of specificities
+plot(ciobj, type="shape", col="#1c61b6AA") # plot as a blue shape
+plot(ci(rocobj, of="thresholds", thresholds="best")) # add one threshold
 
 ```
 
+```{r}
+set.seed(123)
+rf <- randomForest(went_on_backorder ~ . , data = clean_train_under)
+print(rf)
+
+```
 
 ```{r}
-print(leader)
+pred = predict(rf , newdata = clean_test)
+confusionMatrix(data = pred, reference = clean_test$went_on_backorder)  
 
+rocobj <- plot.roc(clean_test$went_on_backorder, predict(rf, type = "prob", newdata = clean_test)[, 2], main="Confidence intervals", percent=TRUE, ci=TRUE, print.auc=TRUE) 
 
-pred_h2o <- h2o.predict(leader, newdata = test_h2o)
-# p0 is the probability of predicting the class (0/1)
-# the results are converted to dataframe by using as.tibble() 
-
-as.tibble(pred_h2o)
+# CI of sensitivity
+ciobj <- ci.se(rocobj, specificities=seq(0, 100, 5)) # over a select set of specificities
+plot(ciobj, type="shape", col="#1c61b6AA") # plot as a blue shape
+plot(ci(rocobj, of="thresholds", thresholds="best")) # add one threshold
 ```
 
 
-## Model Evaluation 
+## 4.3 Logistic Regression
 
-### Performance Metrics
 
 ```{r}
 
-perf_h2o <- h2o.performance(leader, newdata = test_h2o) 
-h2o.metric(perf_h2o) %>% as.tibble() %>% glimpse()
+
+
+lr_model <- glm(went_on_backorder~. -potential_issue -pieces_past_due -deck_risk -oe_constraint -ppap_risk -stop_auto_buy -rev_stop,family=binomial(link='logit'),data= clean_train_under)
+
 
 ```
-### AUC 
-
-Calculating `AUC` for the test set
-
-```{r}
-
-h2o.auc(perf_h2o)
-```
-### ROC 
-```{r}
 
 
 
