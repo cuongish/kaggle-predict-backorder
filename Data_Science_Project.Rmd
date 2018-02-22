@@ -12,10 +12,11 @@ knitr::opts_chunk$set(echo = TRUE)
 Set input folder and working directory
 
 ```{r}
-inputfolder <- "/Users/traanh/Downloads/predict-bo-trial"
+inputfolder <- "/Users/Yen Hoang/OneDrive/Groupwork/predict-bo-trial"
 setwd(inputfolder)
 
 ```
+
 
 Install Packages
 
@@ -29,6 +30,9 @@ Install Packages
 #install.packages("gridExtra")
 #install.packages("GGally")
 #install.packages("rpart.plot")
+install.packages("BaylorEdPsych")
+install.packages("mvnmle")
+install.packages("pscl")
 ```
 ## Preparing Libraries
 ```{r}
@@ -56,6 +60,7 @@ Loading both training and testing datasets
 
 ```{r retrieve data, code_folding=show}
 raw_train <- read.csv(paste(inputfolder, "Kaggle_Training_Dataset_v2.csv",sep="/"), stringsAsFactors = FALSE)
+
 raw_test <- read.csv(paste(inputfolder, "Kaggle_Test_Dataset_v2.csv",sep="/"), stringsAsFactors = FALSE)
 
 ```
@@ -83,131 +88,170 @@ Both training and testing datasets are severely imbalanced
 
 
 ```{r}
+
+#Showing the data imbalance 
 qplot( as.factor(raw_train$went_on_backorder) ) + 
     geom_bar() + 
     labs(x="went_on_backorder", y="Count")
 
 ```
 ```{r}
+#Showing the data with missing values
+library(Amelia)
+missmap(raw_train)
 
-raw_train %>% gather(- went_on_backorder, key = "went_on_backorder",value = "value") %>% ggplot(aes(x = value , y =went_on_backorder)) + geom_point() + facet_wrap(~ went_on_backorder, scales = "free") + theme_bw()
 
 ```
 
 
-
-
+```{r}
+missmap(raw_test)
+```
  
 # 2. Data Cleaning 
 
 
-## 2.1. Rebalance the datasets
 
-We use `ROSE` library to balance the datasets
-https://www.analyticsvidhya.com/blog/2016/03/practical-guide-deal-imbalanced-classification-problems/
-
-```{r}
-
-train_balanced<- ovun.sample(went_on_backorder~., data=raw_train, N=nrow(raw_train), p=0.5, seed=1, method="both")$data 
-
-test_balanced <- ovun.sample(went_on_backorder~., data=raw_test,N=nrow(raw_test), p=0.5, seed=1, method="both")$data
-
-table(train_balanced$went_on_backorder)
-
-```
-```{r}
-
-
-train_balanced_under <- ovun.sample(went_on_backorder ~ ., data = raw_train, method = "under", N = 20000, seed = 1)$data
-
-test_balanced_under <- ovun.sample(went_on_backorder ~ ., data = raw_test, method = "under", N = 5000, seed = 1 )$data
-
-table(train_balanced_under$went_on_backorder)
-```
-
-```{r}
-qplot( as.factor(train_balanced$went_on_backorder) ) + 
-    geom_bar() + 
-    labs(x="went_on_backorder", y="Count")
-```
-## 2.2. Validation Set 80-20 
-We create a validation set from the training data with the random split of 80-20. The validation set would be used for building models.
-```{r}
-
-```
-
-```{r construct training and validation sets}
-
-n <- nrow(train_balanced)
-n_train <- round(0.8 * n) 
-seed <- 1234567
-set.seed(seed)
-train_indices <- sample(1:n, n_train)
-
-raw_train_80 <- train_balanced[train_indices, ]  
-raw_val_20 <- train_balanced[-train_indices, ]  
-
-```
 ## 2.3. Data-Preprocessing 
 
 Next we will clean the datasets by :
   * Dropping unnecessary columns 
   * Handling missing values (*NA*)
-  * Deleting ouliers
+  * Process NA
+  ###Step 1: Recoding both training and testing datasets. Values are recoded to easier for modeling 
 
 ```{r}
 
-# Creating a customized function to clean data : drop `sku` column, eliminate NA and ouliers(-99)
+# Creating a customized function to clean data : drop `sku` column, re-code -99 into NA and catergorial values into mutate(potential_issue = as.factor(potential_issue)) %>% 
+    
+
 preprocess_raw_data <- function(data) {
     # data = data frame of backorder data
     data[data == -99] <- NA
     data %>%
         select(-sku) %>%
-        drop_na() %>%
-        mutate_if(is.character, .funs = function(x) ifelse(x == "Yes", 1, 0)) %>%
-        mutate(went_on_backorder = as.factor(went_on_backorder))
+        mutate_if(is.character, .funs = function(x) ifelse(x == "Yes", 1, 0)) 
+    
 }
 
-# Applying the function created above to these raw datasets : training, testing and validation
+preprocess_data <- function(data) {
+  
+    data %>% mutate(deck_risk = as.factor(deck_risk)) %>% 
+    mutate(oe_constraint = as.factor(oe_constraint)) %>% 
+    mutate(ppap_risk = as.factor(ppap_risk)) %>% 
+    mutate(stop_auto_buy = as.factor(stop_auto_buy)) %>% 
+    mutate(rev_stop = as.factor(rev_stop)) %>%
+    mutate(went_on_backorder = as.factor(went_on_backorder))
+}
 
-clean_train_80 <- preprocess_raw_data(raw_train_80) 
-clean_test <- preprocess_raw_data(raw_val_20)
-clean_val_20 <- preprocess_raw_data(test_balanced)
-clean_train <- preprocess_raw_data(train_balanced)
+# Applying the function created above to training set
 
-clean_train_under <- preprocess_raw_data(train_balanced_under)
+transform_train_1 <- preprocess_raw_data(raw_train)
 
-#Checking whether all datasets are clean and balanced 
+transform_test_1 <- preprocess_raw_data(raw_test)
 
-glimpse(clean_train_80)
-summary(clean_train_80)
-table(clean_train_80$went_on_backorder)
-any(is.na(clean_train_80))
-any(is.na(clean_test))
-any(is.na(clean_val_20))
+# Correlation matrix
 
+str(transform_train_1)
+corr <- round(cor(transform_train_1, use = "pairwise.complete.obs"), 2)
+tail(corr)
+library(reshape2)
+melted_cormat <- melt(corr, na.rm = TRUE)
+head(melted_cormat)
+library(ggplot2)
+ggplot(data = melted_cormat, aes(x = Var1, y = Var2, fill = value)) + geom_tile()
+library(ggcorrplot)
+ggcorrplot(corr)
+
+transform_train <- preprocess_data(transform_train_1)
+transform_test <- preprocess_data(transform_test_1)
+
+```
+
+```{r}
+# Visualizing the data after the pre-process
+
+missmap(transform_train)
+missmap(transform_test)
 
 
 ```
+
+
+
 # 3. Data Visualization
 
 ```{r}
-
-
-qplot( as.factor(raw_train$went_on_backorder) ) + 
-    geom_bar() + 
-    labs(x="went_on_backorder", y="Count")
-
-
-clean_test %>% gather(- went_on_backorder, key = "went_on_backorder",value = "value") %>% ggplot(aes(x = value , y =went_on_backorder)) + geom_point() + facet_wrap(~ went_on_backorder, scales = "free") + theme_bw()
+library(DataExplorer)
+plot_missing(transform_train)
 
 ```
 
 
 
 ```{r}
-write.csv(clean_train_80, "clean_train_80.csv")
-write.csv(clean_test, "clean_test.csv")
+plot_missing(transform_test)
+```
+```{r}
+
+
+```
+```{r}
+#since the missing values in ´lead time´, ´perf_12_month_avg´ and ´perf_6_month_avg´ are more than 5% of both training and testing sets so it's quite safe to just ignore these variables by droping the entire columns out of the datasets 
+
+clean_function <- function(data) {
+    
+    data %>% 
+    select(-lead_time, -perf_12_month_avg , -perf_6_month_avg ) 
+       
+    
+}
+
+clean_train <- clean_function(transform_train)
+clean_test <- clean_function(transform_test)
+plot_missing(clean_train)
+any(is.na(clean_train))
+
+```
+
+```{r}
+str(clean_train)
+```
+
+
+
+
+## 2.1. Rebalance the datasets
+
+
+https://www.analyticsvidhya.com/blog/2016/03/practical-guide-deal-imbalanced-classification-problems/
+
+
+  * Method 1: We both undersample and oversample the training set
+```{r}
+
+train_balanced_both <- ovun.sample(went_on_backorder~ ., data=clean_train,p=0.5, seed=1, N = 500000, method="both")$data 
+
+table(train_balanced_both$went_on_backorder) # showing result after both under and oversampling
+
+```
+
+
+
+  * Method 2: We use undersample to reduce the number of observations of the training dataset
+```{r}
+
+train_balanced_under <- ovun.sample(went_on_backorder ~ ., data = clean_train, method = "under", N = 20000, seed = 1)$data
+
+table(train_balanced_under$went_on_backorder) # Showing the result after undersamling 
+```
+
+```{r}
+qplot( as.factor(train_balanced_both$went_on_backorder) ) + 
+    geom_bar() + 
+    labs(x="went_on_backorder", y="Count")
+any(is.na(train_balanced_both))
+any(is.na(train_balanced_under))
 ```
 
 
@@ -221,10 +265,10 @@ Next we build decision tree model from clean and balanced training dataset
 
 
 sim_tree <- rpart(formula = went_on_backorder ~ . , 
-                  data = clean_train_80, 
+                  data = train_balanced_both, 
                   method = "class",
                   parms = list(split='information'), 
-                  control = rpart.control(maxdepth = 3, cp = 0 ))
+                  control = rpart.control(maxdepth = 5, minsplit = 70, cp = 0.0014 ))
 
 rpart.plot(sim_tree)
 
@@ -234,63 +278,65 @@ rpart.plot(sim_tree)
 ```{r confusion matrix for the basic model}
 
 # Generate predicted classes using the model object
-class_prediction <- predict(sim_tree, clean_test, type = "class")  
+class_prediction <- predict(sim_tree, transform_test, type = "class")  
                             
 # Calculate the confusion matrix for the test set
-confusionMatrix(class_prediction, clean_test$went_on_backorder)
+confusionMatrix(class_prediction, transform_test$went_on_backorder)
 
 ```
 
 ### 4.1.2. ROC curves 
 ```{r}
 
-roc_sim <- plot.roc(clean_test$went_on_backorder, predict(sim_tree, type = "prob", newdata = clean_test)[, 2], main="Confidence intervals", percent=TRUE, ci=TRUE, print.auc=TRUE) 
+roc_sim <- plot.roc(transform_test$went_on_backorder, predict(sim_tree, type = "prob", newdata = transform_test)[, 2], main="Confidence intervals", percent=TRUE, ci=TRUE, print.auc=TRUE) 
+
+
 
 # CI of sensitivity
 ci <- ci.se(roc_sim, specificities=seq(0, 100, 5)) # over a select set of specificities
 plot(ci, type="shape", col="#1c61b6AA") # plot as a blue shape
 plot(ci(roc_sim, of="thresholds", thresholds="best")) # add one threshold
+
 ```
 ## 4.2 Random Forest
 
-```{r}
+CANT RUN THIS
 # Create model with default paramters
 
 control <- trainControl(method="repeatedcv", number=10, repeats=3)
-set.seed(seed)
+set.seed(12345)
 metric <- "Accuracy"
 
 # Using naive rule to fix the mtry parameter
-mtry <- sqrt(ncol(clean_train_under) - 3)
+mtry <- sqrt(ncol(train_balanced_both) - 3)
 
 tunegrid <- expand.grid(.mtry=mtry)
-rf_default <- train(went_on_backorder ~ . , data=clean_train_under, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
+rf_default <- train(went_on_backorder ~ . , data=train_balanced_both, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
 print(rf_default)
 
-pred = predict(rf_default, newdata = test_balanced)
-confusionMatrix(data = pred, reference = test_balanced$went_on_backorder, positive = "Yes")  
+pred = predict(rf_default, newdata = transform_test)
+confusionMatrix(data = pred, reference = transform_test$went_on_backorder, positive = "Yes")  
 
-rocobj <- plot.roc(test_balanced$went_on_backorder, predict(rf_default, type = "prob", newdata = test_balanced)[, 2], main="Confidence intervals", percent=TRUE, ci=TRUE, print.auc=TRUE) 
+rocobj <- plot.roc(transform_test$went_on_backorder, predict(rf_default, type = "prob", newdata = transform_test)[, 2], main="Confidence intervals", percent=TRUE, ci=TRUE, print.auc=TRUE) 
 
 # CI of sensitivity
 ciobj <- ci.se(rocobj, specificities=seq(0, 100, 5)) # over a select set of specificities
 plot(ciobj, type="shape", col="#1c61b6AA") # plot as a blue shape
 plot(ci(rocobj, of="thresholds", thresholds="best")) # add one threshold
 
+
+```{r}
+set.seed(1234567)
+rf <- randomForest(went_on_backorder ~ . , data = train_balanced_both, mtry=4, ntree = 500)
+
+
 ```
 
 ```{r}
-set.seed(123)
-rf <- randomForest(went_on_backorder ~ . , data = clean_train_under)
-print(rf)
+pred = predict(rf , newdata = transform_test)
+confusionMatrix(data = pred, reference = transform_test$went_on_backorder)  
 
-```
-
-```{r}
-pred = predict(rf , newdata = clean_test)
-confusionMatrix(data = pred, reference = clean_test$went_on_backorder)  
-
-rocobj <- plot.roc(clean_test$went_on_backorder, predict(rf, type = "prob", newdata = clean_test)[, 2], main="Confidence intervals", percent=TRUE, ci=TRUE, print.auc=TRUE) 
+rocobj <- plot.roc(transform_test$went_on_backorder, predict(rf, type = "prob", newdata = transform_test)[, 2], main="Confidence intervals", percent=TRUE, ci=TRUE, print.auc=TRUE) 
 
 # CI of sensitivity
 ciobj <- ci.se(rocobj, specificities=seq(0, 100, 5)) # over a select set of specificities
@@ -303,13 +349,160 @@ plot(ci(rocobj, of="thresholds", thresholds="best")) # add one threshold
 
 
 ```{r}
+model_log <- glm(went_on_backorder ~ .-potential_issue -pieces_past_due -deck_risk -oe_constraint -ppap_risk -stop_auto_buy -rev_stop, data = train_balanced_both, family = binomial(link = "logit"))
+summary(model_log)
+
+```
+
+```{r}
+
+#Results of models
 
 
+anova(model_log, test="Chisq")
 
-lr_model <- glm(went_on_backorder~. -potential_issue -pieces_past_due -deck_risk -oe_constraint -ppap_risk -stop_auto_buy -rev_stop,family=binomial(link='logit'),data= clean_train_under)
 
 
 ```
+
+```{r}
+#McFadden R2 index can be used to assess the model fit.
+library(pscl)
+pR2(model_log)
+```
+
+#Run logistic regression model with all variables
+
+```{r}
+model_log_2 <- glm(went_on_backorder ~ ., data = train_balanced_both, family = binomial(link = "logit"))
+summary(model_log_2)
+```
+```{r}
+#McFadden R2 index can be used to assess the model fit.
+library(pscl)
+pR2(model_log_2)
+```
+```{r}
+
+fitted.results <- predict(model_log_2, newdata= clean_test,type='response')
+fitted.results <- ifelse(fitted.results > 0.5,1,0)
+
+
+
+confusionMatrix(fitted.results, transform_test$went_on_backorder)
+
+library(ROCR)
+
+pr <- prediction(fitted.results, transform_test$went_on_backorder)
+
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+
+
+```
+
+
+## 4.4 h2o.ai model
+
+
+
+```{r}
+library(h2o)
+h2o.init(nthreads = -1, max_mem_size = '16g', ip = "127.0.0.1", port = 54321)
+
+
+
+```
+```{r}
+h2o.no_progress()
+
+```
+```{r}
+# Convert to H2OFrame as h20o package doesnt work with dataframe
+train_h2o <- as.h2o(train_df)
+valid_h2o <- as.h2o(valid_df)
+test_h2o  <- as.h2o(test_df)
+
+```
+
+
+
+```{r}
+# Automatic Machine Learning
+y <- "went_on_backorder"
+x <- setdiff(names(train_h2o), y)
+
+automl_models_h2o <- h2o.automl(
+    x = x, 
+    y = y,
+    training_frame    = train_h2o,
+    validation_frame  = valid_h2o,
+    leaderboard_frame = test_h2o,
+    max_runtime_secs  = 45
+)
+
+#Extract out leader model.
+
+automl_leader <- automl_models_h2o@leader
+```
+
+```{r}
+pred_h2o <- h2o.predict(automl_leader, newdata = test_h2o)
+as.tibble(pred_h2o)
+```
+## Accessing performace
+
+```{r}
+perf_h2o <- h2o.performance(automl_leader, newdata = test_h2o) 
+
+# Getting performance metrics
+h2o.metric(perf_h2o) %>%
+    as.tibble() %>%
+    glimpse()
+```
+
+```{r}
+# Plot ROC Curve
+left_join(h2o.tpr(perf_h2o), h2o.fpr(perf_h2o)) %>%
+    mutate(random_guess = fpr) %>%
+    select(-threshold) %>%
+    ggplot(aes(x = fpr)) +
+    geom_area(aes(y = tpr, fill = "AUC"), alpha = 0.5) +
+    geom_point(aes(y = tpr, color = "TPR"), alpha = 0.25) +
+    geom_line(aes(y = random_guess, color = "Random Guess"), size = 1, linetype = 2) +
+    theme_tq() +
+    scale_color_manual(
+        name = "Key", 
+        values = c("TPR" = palette_dark()[[1]],
+                   "Random Guess" = palette_dark()[[2]])
+        ) +
+    scale_fill_manual(name = "Fill", values = c("AUC" = palette_dark()[[5]])) +
+    labs(title = "ROC Curve", 
+         subtitle = "Model is performing much better than random guessing") +
+    annotate("text", x = 0.25, y = 0.65, label = "Better than guessing") +
+    annotate("text", x = 0.75, y = 0.25, label = "Worse than guessing")
+
+```
+```{r}
+# AUC Calculation
+h2o.auc(perf_h2o)
+# predictions are based on p1_cutoff
+as.tibble(pred_h2o)
+# Algorithm uses p1_cutoff that maximizes F1
+h2o.F1(perf_h2o) %>%
+    as.tibble() %>%
+    filter(f1 == max(f1))
+```
+```{r}
+# Full list of thresholds at various performance metrics
+perf_h2o@metrics$max_criteria_and_metric_scores
+```
+
+
 
 
 
